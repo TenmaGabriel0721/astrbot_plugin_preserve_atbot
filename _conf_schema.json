@@ -1,0 +1,42 @@
+{
+    "bot_display_name": {
+        "description": "机器人显示名称",
+        "type": "string",
+        "hint": "无法从平台消息获取昵称时使用。例如填写“珈宝”，注入文本就是 @珈宝。",
+        "default": "Bot"
+    },
+    "prefer_detected_name": {
+        "description": "优先使用平台检测到的机器人昵称",
+        "type": "bool",
+        "hint": "关闭后始终使用上面的机器人显示名称。",
+        "default": true
+    },
+    "marker_template": {
+        "description": "注入文本模板",
+        "type": "string",
+        "hint": "必须包含 {name}，例如“@{name}”或“[用户正在@{name}]”。",
+        "default": "@{name}"
+    },
+    "platforms": {
+        "description": "启用的平台",
+        "type": "list",
+        "hint": "默认支持 QQ 官方 API、QQ 官方 Webhook 和 OneBot/aiocqhttp。",
+        "default": [
+            "qq_official",
+            "qq_official_webhook",
+            "aiocqhttp"
+        ]
+    },
+    "sync_event_message": {
+        "description": "同步修改事件纯文本",
+        "type": "bool",
+        "hint": "除 LLM prompt 外，也同步更新 event.message_str，方便后续低优先级插件读取。",
+        "default": true
+    },
+    "debug_log": {
+        "description": "输出调试日志",
+        "type": "bool",
+        "hint": "开启后记录每次 @bot 注入的检测来源。",
+        "default": false
+    }
+}
