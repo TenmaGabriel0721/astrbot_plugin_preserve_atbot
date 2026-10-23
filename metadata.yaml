@@ -1,8 +1,8 @@
 name: astrbot_plugin_preserve_atbot
-display_name: 保留 @Bot 上下文
-desc: 在群聊消息进入 LLM 前，把已被框架剥离的 @bot 恢复成普通文本标识。
-help: 插件启用后自动工作，无需命令。支持 QQ 官方 API、QQ 官方 Webhook 和 OneBot/aiocqhttp。
-version: 1.0.0
+display_name: 保留 @Bot 与引用上下文
+desc: 在群聊消息进入 LLM 前，恢复被框架剥离的 @bot，并补全 OneBot 引用消息发送人信息。
+help: 插件启用后自动工作，无需命令。支持 QQ 官方 API、QQ 官方 Webhook 和 OneBot/aiocqhttp；引用发送人补全目前用于 aiocqhttp。
+version: 1.1.0
 author: TenmaGabriel0721
 repo: https://github.com/TenmaGabriel0721/astrbot_plugin_preserve_atbot
 support_platforms:

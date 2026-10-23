@@ -8,6 +8,7 @@ AstrBot 的平台适配器会从 ``message_str`` 中移除唤醒机器人的 At 
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, ComponentTypes, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.platform.message_type import MessageType
@@ -27,6 +28,10 @@ DEFAULT_PLATFORMS = frozenset({"qq_official", "qq_official_webhook", "aiocqhttp"
 CQ_AT_RE = re.compile(r"\[CQ:at,([^\]]+)]", re.IGNORECASE)
 CQ_PARAM_RE = re.compile(r"(?:^|,)\s*([A-Za-z_][\w-]*)=([^,]*)")
 QQ_OFFICIAL_AT_RE = re.compile(r"<@!?([^>]+)>")
+
+# ---- 引用消息发送人补全相关 ----
+SUPPORTED_QUOTE_PLATFORMS = frozenset({"aiocqhttp"})
+_REPLY_DATA_ID_KEYS = ("message_id", "id", "msg_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,11 +67,11 @@ def _clean_name(value: Any) -> str:
 @register(
     PLUGIN_NAME,
     "Codex",
-    "在 LLM 请求前保留群聊消息中的 @bot 文本标识",
-    "1.0.0",
+    "保留群聊 @bot 文本，并补全引用消息发送人信息",
+    "1.1.0",
 )
 class PreserveAtBotPlugin(Star):
-    """检测 QQ/OneBot 的 @bot 消息并向 LLM prompt 注入普通文本。"""
+    """增强群聊中的 @bot 与引用消息上下文。"""
 
     def __init__(
         self,
@@ -105,9 +110,31 @@ class PreserveAtBotPlugin(Star):
         self.prefer_detected_name = bool(self.config.get("prefer_detected_name", True))
         self.sync_event_message = bool(self.config.get("sync_event_message", True))
         self.debug_log = bool(self.config.get("debug_log", False))
+        self.enhance_quote_sender = bool(
+            self.config.get("enhance_quote_sender", True)
+        )
+        self.quote_sender_fallback_name = _clean_name(
+            self.config.get("quote_sender_fallback_name", "Unknown User")
+        )
+        try:
+            self.quote_sender_timeout = max(
+                0.1,
+                min(float(self.config.get("quote_sender_timeout", 5.0)), 30.0),
+            )
+        except (TypeError, ValueError):
+            self.quote_sender_timeout = 5.0
 
     @filter.on_llm_request(priority=-10000)
-    async def preserve_at_bot(
+    async def enhance_context(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """补全引用发送人，然后保留群聊中的 @bot 文本。"""
+        await self._complete_quote_senders(event, req)
+        await self._preserve_at_bot(event, req)
+
+    async def _preserve_at_bot(
         self,
         event: AstrMessageEvent,
         req: ProviderRequest,
@@ -130,9 +157,12 @@ class PreserveAtBotPlugin(Star):
         else:
             display_name = self.fallback_name or detected_name or "Bot"
 
-        marker = self.marker_template.format(name=display_name).strip()
+        marker_name = display_name
+        if mention.target_id:
+            marker_name = f"{display_name}(QQ: {mention.target_id})"
+        marker = self.marker_template.format(name=marker_name).strip()
         if not marker:
-            marker = f"@{display_name}"
+            marker = f"@{marker_name}"
 
         old_prompt = (
             req.prompt
@@ -159,6 +189,201 @@ class PreserveAtBotPlugin(Star):
                 platform,
                 mention.source,
                 mention.target_id,
+            )
+
+    async def _complete_quote_senders(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """补全 Reply 元数据，并同步修正已构建的 LLM 引用文本。"""
+        if not self.enhance_quote_sender:
+            return
+
+        platform = event.get_platform_name()
+        if platform not in SUPPORTED_QUOTE_PLATFORMS:
+            return
+
+        replies = [comp for comp in event.get_messages() if isinstance(comp, Reply)]
+        if not replies:
+            return
+
+        changed = False
+        for reply in replies:
+            sender_name = _clean_name(getattr(reply, "sender_nickname", ""))
+            sender_id = _clean_identifier(getattr(reply, "sender_id", ""))
+            if sender_id == "0":
+                sender_id = ""
+
+            payload = None
+            if not sender_name or not sender_id:
+                payload = await self._fetch_quoted_message(event, reply)
+                if payload:
+                    fetched_id, fetched_name = self._extract_sender(payload)
+                    sender_id = sender_id or fetched_id
+                    sender_name = sender_name or fetched_name
+
+            if not sender_name:
+                sender_name = sender_id or (
+                    self.quote_sender_fallback_name if payload else ""
+                )
+            if not sender_name and not sender_id:
+                continue
+
+            reply.sender_nickname = sender_name
+            if sender_id:
+                reply.sender_id = sender_id
+                reply.qq = int(sender_id) if sender_id.isdigit() else 0
+            if payload:
+                self._fill_reply_content(reply, payload)
+            self._replace_quoted_sender(req, sender_name, sender_id)
+            changed = True
+
+            if self.debug_log:
+                logger.info(
+                    "[%s] 已补全引用发送人，platform=%s reply_id=%s sender=%s(%s)",
+                    PLUGIN_NAME,
+                    platform,
+                    _clean_identifier(reply.id),
+                    sender_name,
+                    sender_id or "unknown",
+                )
+
+        if changed:
+            event.set_extra("_preserved_quote_sender", True)
+
+    async def _fetch_quoted_message(
+        self,
+        event: AstrMessageEvent,
+        reply: Reply,
+    ) -> Mapping[str, Any] | None:
+        reply_id = _clean_identifier(getattr(reply, "id", ""))
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not reply_id or not callable(call_action):
+            return None
+
+        params: list[str | int] = [reply_id]
+        if reply_id.isdigit():
+            params.append(int(reply_id))
+        last_error: Exception | None = None
+        for message_id in params:
+            try:
+                result = await asyncio.wait_for(
+                    call_action("get_msg", message_id=message_id),
+                    timeout=self.quote_sender_timeout,
+                )
+                payload = self._unwrap_action_payload(result)
+                if payload:
+                    return payload
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+
+        if self.debug_log and last_error is not None:
+            logger.warning(
+                "[%s] 引用消息补全失败，reply_id=%s: %s",
+                PLUGIN_NAME,
+                reply_id,
+                last_error,
+            )
+        return None
+
+    @staticmethod
+    def _unwrap_action_payload(result: Any) -> Mapping[str, Any] | None:
+        if not isinstance(result, Mapping):
+            return None
+        data = result.get("data")
+        return data if isinstance(data, Mapping) else result
+
+    @staticmethod
+    def _extract_sender(payload: Mapping[str, Any]) -> tuple[str, str]:
+        sender = _value(payload, "sender", None)
+        if not isinstance(sender, Mapping):
+            sender = {}
+        sender_id = _clean_identifier(
+            _value(sender, "user_id", None)
+            or _value(sender, "id", None)
+            or _value(payload, "user_id", None)
+        )
+        sender_name = _clean_name(
+            _value(sender, "card", None)
+            or _value(sender, "nickname", None)
+            or _value(sender, "nick", None)
+            or _value(payload, "sender_name", None)
+        )
+        return sender_id, sender_name
+
+    @staticmethod
+    def _fill_reply_content(reply: Reply, payload: Mapping[str, Any]) -> None:
+        segments = _value(payload, "message", None)
+        if not getattr(reply, "chain", None) and isinstance(segments, list):
+            chain = []
+            for segment in segments:
+                segment_type = str(_value(segment, "type", "")).lower()
+                component_type = ComponentTypes.get(segment_type)
+                data = _value(segment, "data", None)
+                if component_type is None or not isinstance(data, Mapping):
+                    continue
+                try:
+                    chain.append(component_type(**dict(data)))
+                except Exception:  # noqa: BLE001
+                    continue
+            if chain:
+                reply.chain = chain
+
+        if not _clean_identifier(getattr(reply, "message_str", "")):
+            plain_texts = [
+                comp.text
+                for comp in (getattr(reply, "chain", None) or [])
+                if isinstance(comp, Plain) and comp.text
+            ]
+            text = "".join(plain_texts).strip()
+            if not text:
+                raw_message = _value(payload, "raw_message", "")
+                if isinstance(raw_message, str):
+                    text = raw_message.strip()
+            if text:
+                reply.message_str = text
+                reply.text = text
+
+        timestamp = _value(payload, "time", None)
+        if timestamp is not None and not getattr(reply, "time", 0):
+            try:
+                reply.time = int(timestamp)
+            except (TypeError, ValueError):
+                pass
+
+    @staticmethod
+    def _replace_quoted_sender(
+        req: ProviderRequest,
+        sender_name: str,
+        sender_id: str,
+    ) -> None:
+        """LLM 请求此时已构建完毕，原地修正引用发送人昵称与 QQ 号。"""
+        if not req.extra_user_content_parts:
+            return
+        if sender_name and sender_id and sender_name != sender_id:
+            sender_label = f"{sender_name}, QQ: {sender_id}"
+        elif sender_name:
+            sender_label = sender_name
+        elif sender_id:
+            sender_label = f"QQ: {sender_id}"
+        else:
+            return
+
+        for part in req.extra_user_content_parts:
+            text = getattr(part, "text", None)
+            if not isinstance(text, str) or "<Quoted Message>" not in text:
+                continue
+            prefix, separator, suffix = text.partition("<Quoted Message>\n")
+            if not separator:
+                continue
+            first_line, newline, remainder = suffix.partition("\n")
+            if first_line.startswith("(") and "): " in first_line:
+                _, _, first_line = first_line.partition("): ")
+            part.text = (
+                f"{prefix}{separator}({sender_label}): {first_line}"
+                f"{newline}{remainder}"
             )
 
     @staticmethod
