@@ -1,10 +1,4 @@
-"""在 LLM 请求前把群聊中的 @bot 恢复成普通文本。
-
-AstrBot 的平台适配器会从 ``message_str`` 中移除唤醒机器人的 At 消息段，
-但结构化消息链和平台原始消息仍保留相关信息。本插件在
-``on_llm_request`` 阶段识别这些信息，并把 ``@机器人名称`` 注入
-``ProviderRequest.prompt``，使模型能够区分是否有人明确提到了机器人。
-"""
+"""Preserve plugin speech, bot mentions, and quoted messages in conversation."""
 
 from __future__ import annotations
 
@@ -12,6 +6,7 @@ import asyncio
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -20,6 +15,11 @@ from astrbot.api.message_components import At, ComponentTypes, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+from .send_capture import SendCapture
+from .sent_history import SentHistory
+from .shared_context import apply_group_window, shared_group_limit
 
 PLUGIN_NAME = "astrbot_plugin_preserve_atbot"
 QQ_OFFICIAL_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
@@ -66,12 +66,12 @@ def _clean_name(value: Any) -> str:
 
 @register(
     PLUGIN_NAME,
-    "Codex",
-    "保留群聊 @bot 文本，并补全引用消息发送人信息",
-    "1.1.0",
+    "TenmaGabriel0721",
+    "对话拾遗：按对话顺序保留插件发言，补全 @Bot 与引用上下文",
+    "1.3.1",
 )
 class PreserveAtBotPlugin(Star):
-    """增强群聊中的 @bot 与引用消息上下文。"""
+    """Restore missing conversation context from plugin sends, mentions, and replies."""
 
     def __init__(
         self,
@@ -110,9 +110,7 @@ class PreserveAtBotPlugin(Star):
         self.prefer_detected_name = bool(self.config.get("prefer_detected_name", True))
         self.sync_event_message = bool(self.config.get("sync_event_message", True))
         self.debug_log = bool(self.config.get("debug_log", False))
-        self.enhance_quote_sender = bool(
-            self.config.get("enhance_quote_sender", True)
-        )
+        self.enhance_quote_sender = bool(self.config.get("enhance_quote_sender", True))
         self.quote_sender_fallback_name = _clean_name(
             self.config.get("quote_sender_fallback_name", "Unknown User")
         )
@@ -124,15 +122,116 @@ class PreserveAtBotPlugin(Star):
         except (TypeError, ValueError):
             self.quote_sender_timeout = 5.0
 
+        self.record_plugin_messages = bool(
+            self.config.get("record_plugin_messages", True)
+        )
+        try:
+            self.recent_plugin_message_count = max(
+                0, min(int(self.config.get("recent_plugin_message_count", 10)), 100)
+            )
+        except (TypeError, ValueError):
+            self.recent_plugin_message_count = 10
+        self.sent_history: SentHistory | None = None
+        self.send_capture: SendCapture | None = None
+
+    async def initialize(self) -> None:
+        """Initialize speech storage and reversible send capture when enabled."""
+        if not self.record_plugin_messages:
+            return
+        path = (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / PLUGIN_NAME
+            / "sent_history.db"
+        )
+        self.sent_history = await asyncio.to_thread(
+            SentHistory, path, self.recent_plugin_message_count
+        )
+        self.send_capture = SendCapture(self, self.sent_history)
+        try:
+            self.send_capture.install()
+        except Exception:
+            self.send_capture.close()
+            self.sent_history.close()
+            self.send_capture = None
+            self.sent_history = None
+            raise
+        logger.info(
+            "[%s] 已启用插件发言记录，每个 Bot 会话分支%s；启用群聊上下文感知时共享其消息数量上限。",
+            PLUGIN_NAME,
+            f"保留最近 {self.recent_plugin_message_count} 条"
+            if self.recent_plugin_message_count
+            else "不限制保留数量",
+        )
+
+    @filter.on_plugin_loaded()
+    async def capture_loaded_plugin(self, metadata: Any) -> None:
+        """Refresh handler ownership after a plugin is loaded or reloaded.
+
+        Args:
+            metadata: Metadata supplied by AstrBot's plugin lifecycle hook.
+        """
+        if self.send_capture:
+            self.send_capture.install_handlers()
+            self.send_capture.install_protocols()
+            self.send_capture.install_group_context()
+
+    @filter.on_platform_loaded()
+    async def capture_loaded_platform(self) -> None:
+        """Cover the current OneBot API objects after platform initialization."""
+        if self.send_capture:
+            self.send_capture.install_protocols()
+
+    async def terminate(self) -> None:
+        """Remove owned capture wrappers before closing speech storage."""
+        if self.send_capture:
+            self.send_capture.close()
+            self.send_capture = None
+        if self.sent_history:
+            await asyncio.to_thread(self.sent_history.close)
+            self.sent_history = None
+
     @filter.on_llm_request(priority=-10000)
     async def enhance_context(
         self,
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> None:
-        """补全引用发送人，然后保留群聊中的 @bot 文本。"""
+        """补全引用与 @bot，并将近期插件发言嵌入普通对话消息。"""
         await self._complete_quote_senders(event, req)
         await self._preserve_at_bot(event, req)
+        store = getattr(self, "sent_history", None)
+        if store is not None and req.conversation is not None:
+            try:
+                current_id = str(getattr(event.message_obj, "message_id", "") or "")
+                allowed_ids = None
+                window = None
+                group_limit = shared_group_limit(self.context, event.unified_msg_origin)
+                if group_limit:
+                    window = await asyncio.to_thread(
+                        store.group_window,
+                        event.unified_msg_origin,
+                        req.conversation.cid,
+                        group_limit,
+                        event.get_extra("_group_context_record_id", ""),
+                    )
+                    allowed_ids = {
+                        item["entry_id"] for item in window if item["kind"] == "sent"
+                    }
+                req.contexts = await asyncio.to_thread(
+                    store.merge,
+                    req.contexts,
+                    event.unified_msg_origin,
+                    req.conversation.cid,
+                    current_id,
+                    allowed_record_ids=allowed_ids,
+                )
+                if window is not None:
+                    apply_group_window(req, window)
+            except Exception:
+                logger.exception(
+                    "[%s] 无法合并近期插件发言，保留原始对话上下文。", PLUGIN_NAME
+                )
 
     async def _preserve_at_bot(
         self,
@@ -382,8 +481,7 @@ class PreserveAtBotPlugin(Star):
             if first_line.startswith("(") and "): " in first_line:
                 _, _, first_line = first_line.partition("): ")
             part.text = (
-                f"{prefix}{separator}({sender_label}): {first_line}"
-                f"{newline}{remainder}"
+                f"{prefix}{separator}({sender_label}): {first_line}{newline}{remainder}"
             )
 
     @staticmethod

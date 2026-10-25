@@ -1,26 +1,38 @@
 {
+    "record_plugin_messages": {
+        "description": "将插件发言补入对话",
+        "type": "bool",
+        "hint": "发送获得平台回执后记录原文及来源，下次模型请求时按顺序插入正常助手消息。开启群聊上下文感知时，群聊补充消息与插件发言合计受其“最大消息数量”限制。按 Bot、聊天和会话分支隔离。",
+        "default": true
+    },
+    "recent_plugin_message_count": {
+        "description": "近期插件发言保留条数",
+        "type": "int",
+        "hint": "默认 10；1～100 是插件发言自身的保留上限，0 不设额外上限。开启群聊上下文感知时，群聊补充消息和插件发言仍共用其“最大消息数量”：例如设为 42，两者合计最多 42 条。是否记录由上方开关控制。",
+        "default": 10
+    },
     "bot_display_name": {
         "description": "机器人显示名称",
         "type": "string",
-        "hint": "无法从平台消息获取昵称时使用。例如填写“珈宝”，注入文本就是 @珈宝。",
+        "hint": "平台未提供昵称，或关闭“优先使用平台昵称”时使用。检测到机器人 ID 时会附加显示，例如 @珈宝(QQ: 123456)。",
         "default": "Bot"
     },
     "prefer_detected_name": {
-        "description": "优先使用平台检测到的机器人昵称",
+        "description": "优先使用平台昵称",
         "type": "bool",
         "hint": "关闭后始终使用上面的机器人显示名称。",
         "default": true
     },
     "marker_template": {
-        "description": "注入文本模板",
+        "description": "@Bot 文本格式",
         "type": "string",
         "hint": "必须包含 {name}；{name} 会包含机器人昵称和 QQ 号，例如“@{name}”会生成“@珈宝(QQ: 123456)”。",
         "default": "@{name}"
     },
     "platforms": {
-        "description": "启用的平台",
+        "description": "恢复 @Bot 文本的平台",
         "type": "list",
-        "hint": "默认支持 QQ 官方 API、QQ 官方 Webhook 和 OneBot/aiocqhttp。",
+        "hint": "默认包含 QQ 官方 API、Webhook 和 OneBot/aiocqhttp。此项用于 @Bot 文本恢复；插件发言记录与引用补全各自按支持的平台工作。列表留空时不限制平台。",
         "default": [
             "qq_official",
             "qq_official_webhook",
@@ -28,33 +40,33 @@
         ]
     },
     "sync_event_message": {
-        "description": "同步修改事件纯文本",
+        "description": "向后续插件同步 @Bot 文本",
         "type": "bool",
-        "hint": "除 LLM prompt 外，也同步更新 event.message_str，方便后续低优先级插件读取。",
+        "hint": "让后续处理这条消息的插件也能读到恢复后的 @Bot 文本。",
         "default": true
     },
     "debug_log": {
         "description": "输出调试日志",
         "type": "bool",
-        "hint": "开启后记录每次 @bot 注入的检测来源。",
+        "hint": "输出 @Bot 检测来源，以及引用发送人的补全结果或查询错误，便于排查问题。",
         "default": false
     },
     "enhance_quote_sender": {
         "description": "补全引用消息发送人",
         "type": "bool",
-        "hint": "开启后，当被引用消息（含纯图片）的发送人信息缺失时，主动通过 OneBot get_msg 拉取并补全 Reply 组件的 sender_nickname / sender_id，使 LLM 上下文能显示“引用者(昵称): 内容”。默认开启。",
+        "hint": "适用于 OneBot/aiocqhttp。引用消息缺少发送人昵称或有效 ID 时查询原消息，补回发送人及可恢复的文本、图片，让模型知道被引用的内容是谁发出的。",
         "default": true
     },
     "quote_sender_fallback_name": {
-        "description": "引用发送人回退名称",
+        "description": "引用发送人的备用名称",
         "type": "string",
-        "hint": "当通过 get_msg 仍无法获取被引用消息发送人昵称时使用的回退名称，留空则只回退到 sender_id。",
+        "hint": "查到原消息但仍缺少昵称和有效 ID 时使用。只有 ID 时优先显示 ID；留空则不添加备用名称。",
         "default": "Unknown User"
     },
     "quote_sender_timeout": {
-        "description": "引用发送人补全超时(秒)",
+        "description": "引用查询超时（秒）",
         "type": "float",
-        "hint": "调用 get_msg 拉取被引用消息的单次超时时间，超时则放弃补全，避免阻塞回复。",
+        "hint": "每次查询被引用消息的最长等待时间，范围 0.1～30 秒。查询失败后继续处理原消息。",
         "default": 5.0
     }
 }
