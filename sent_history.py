@@ -8,7 +8,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 CHECKPOINT_PREFIX = "preserve_atbot:sent:"
@@ -376,7 +376,7 @@ class SentHistory:
             source = record.get("source") or {}
             name = source.get("display_name") or source.get("name") or "来源未知"
             version = source.get("version") or "未知"
-            sent_at = record.get("sent_at") or datetime.now(timezone.utc).isoformat()
+            sent_at = record.get("sent_at") or datetime.now(UTC).isoformat()
             annotation = f"\n\n【插件发言来源：{name}；插件：{source.get('name') or '未知'}；版本：{version}；发送时间：{sent_at}】"
             if record.get("partial_send"):
                 annotation += "\n【发送状态：部分消息获得回执，原始内容可能未全部发送】"

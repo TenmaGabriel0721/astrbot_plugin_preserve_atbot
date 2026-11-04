@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from sys import maxsize
 from typing import Any
 
 from astrbot.api import logger
@@ -17,6 +18,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from .history_images import HistoryImages
 from .send_capture import SendCapture
 from .sent_history import SentHistory
 from .shared_context import apply_group_window, shared_group_limit
@@ -68,7 +70,7 @@ def _clean_name(value: Any) -> str:
     PLUGIN_NAME,
     "TenmaGabriel0721",
     "对话拾遗：按对话顺序保留插件发言，补全 @Bot 与引用上下文",
-    "1.3.1",
+    "1.4.0",
 )
 class PreserveAtBotPlugin(Star):
     """Restore missing conversation context from plugin sends, mentions, and replies."""
@@ -133,9 +135,16 @@ class PreserveAtBotPlugin(Star):
             self.recent_plugin_message_count = 10
         self.sent_history: SentHistory | None = None
         self.send_capture: SendCapture | None = None
+        settings = self.config.get("image_cache", {})
+        self.images = HistoryImages(
+            self,
+            settings if isinstance(settings, Mapping) else {},
+            Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME / "image_cache",
+        )
 
     async def initialize(self) -> None:
         """Initialize speech storage and reversible send capture when enabled."""
+        await self.images.initialize()
         if not self.record_plugin_messages:
             return
         path = (
@@ -144,17 +153,14 @@ class PreserveAtBotPlugin(Star):
             / PLUGIN_NAME
             / "sent_history.db"
         )
-        self.sent_history = await asyncio.to_thread(
-            SentHistory, path, self.recent_plugin_message_count
-        )
-        self.send_capture = SendCapture(self, self.sent_history)
         try:
+            self.sent_history = await asyncio.to_thread(
+                SentHistory, path, self.recent_plugin_message_count
+            )
+            self.send_capture = SendCapture(self, self.sent_history)
             self.send_capture.install()
-        except Exception:
-            self.send_capture.close()
-            self.sent_history.close()
-            self.send_capture = None
-            self.sent_history = None
+        except BaseException:
+            await self.terminate()
             raise
         logger.info(
             "[%s] 已启用插件发言记录，每个 Bot 会话分支%s；启用群聊上下文感知时共享其消息数量上限。",
@@ -190,6 +196,50 @@ class PreserveAtBotPlugin(Star):
         if self.sent_history:
             await asyncio.to_thread(self.sent_history.close)
             self.sent_history = None
+        if getattr(self, "images", None):
+            await self.images.terminate()
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=maxsize)
+    async def capture_history_images(self, event: AstrMessageEvent) -> None:
+        """Passive capture runs before the built-in group collector, without replying."""
+        await self.images.capture(event)
+
+    @filter.llm_tool(name="preserve_image_list")
+    async def preserve_image_list(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 10,
+        sender_id: str = "",
+        message_id: str = "",
+        before: str = "",
+    ) -> str:
+        """查询当前 Bot、聊天和会话分支的历史图片编号及发送人，不会查看图片内容。用户提到以前的图片而上下文没有编号时调用。
+
+        Args:
+            limit(number): 返回条数，1 到 20，默认 10。
+            sender_id(string): 可选，按图片原发送者 ID 筛选。
+            message_id(string): 可选，按原消息 ID 筛选。
+            before(string): 可选，上一页末条图片编号，用于翻页。
+        """
+        return await self.images.list_images(
+            event, limit, sender_id, message_id, before
+        )
+
+    @filter.llm_tool(name="preserve_image_view")
+    async def preserve_image_view(self, event: AstrMessageEvent, image_ids: list[str]):
+        """按编号查看当前会话历史图片，每次最多 3 张。只在需要图像内容时调用；返回静态 JPEG 预览，动图仅首帧，不向 QQ 发送消息。
+
+        Args:
+            image_ids(array[string]): 上下文图片说明或 preserve_image_list 给出的编号，1 到 3 个。
+        """
+        return await self.images.view_images(event, image_ids)
+
+    @filter.on_agent_done()
+    async def drop_history_image_previews(
+        self, event: AstrMessageEvent, run_context, resp
+    ) -> None:
+        """Remove this tool's previews after the model has answered, retaining IDs."""
+        await self.images.drop_previews(event, run_context)
 
     @filter.on_llm_request(priority=-10000)
     async def enhance_context(
@@ -231,6 +281,14 @@ class PreserveAtBotPlugin(Star):
             except Exception:
                 logger.exception(
                     "[%s] 无法合并近期插件发言，保留原始对话上下文。", PLUGIN_NAME
+                )
+        images = getattr(self, "images", None)
+        if images is not None:
+            try:
+                await images.prepare_request(event, req)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] 历史图片请求增强失败 (%s)", PLUGIN_NAME, type(exc).__name__
                 )
 
     async def _preserve_at_bot(

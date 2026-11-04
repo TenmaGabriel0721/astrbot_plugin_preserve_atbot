@@ -9,8 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import botpy.message
 from aiocqhttp import CQHttp
-from botpy.api import BotAPI
-
 from astrbot.core.agent.message import (
     bind_checkpoint_messages,
     dump_messages_with_checkpoints,
@@ -30,6 +28,7 @@ from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
     QQOfficialMessageEvent,
 )
 from astrbot.core.star.context import Context
+from botpy.api import BotAPI
 from data.plugins.astrbot_plugin_preserve_atbot import main as plugin_main
 from data.plugins.astrbot_plugin_preserve_atbot.send_capture import (
     ENVELOPE,
@@ -280,6 +279,9 @@ class RecordingSwitchTests(unittest.IsolatedAsyncioTestCase):
                     plugin.recent_plugin_message_count = limit
                     plugin.sent_history = None
                     plugin.send_capture = None
+                    plugin.images = SimpleNamespace(
+                        initialize=AsyncMock(), terminate=AsyncMock()
+                    )
                     with (
                         patch.object(
                             plugin_main,
@@ -292,6 +294,7 @@ class RecordingSwitchTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         try:
                             await plugin.initialize()
+                            plugin.images.initialize.assert_awaited_once()
                             if enabled:
                                 storage.assert_called_once()
                                 capture.return_value.install.assert_called_once()

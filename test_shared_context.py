@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from astrbot.api.message_components import Plain
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
 from astrbot.core.agent.message import (

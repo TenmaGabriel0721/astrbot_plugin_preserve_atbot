@@ -68,5 +68,51 @@
         "type": "float",
         "hint": "每次查询被引用消息的最长等待时间，范围 0.1～30 秒。查询失败后继续处理原消息。",
         "default": 5.0
+    },
+    "image_cache": {
+        "description": "历史图片按需查看",
+        "type": "object",
+        "hint": "被动缓存图片，保留编号并通过工具按需查看；独立于插件发言记录开关。",
+        "items": {
+            "enabled": {
+                "description": "启用历史图片",
+                "type": "bool",
+                "default": true
+            },
+            "platforms": {
+                "description": "图片缓存平台",
+                "type": "list",
+                "default": [
+                    "aiocqhttp",
+                    "qq_official",
+                    "qq_official_webhook"
+                ],
+                "hint": "留空表示全部受支持平台；不影响 @Bot 的平台设置。"
+            },
+            "retention_hours": {
+                "description": "保留小时数",
+                "type": "int",
+                "default": 72,
+                "hint": "范围 1～720 小时，过期自动清理。"
+            },
+            "max_cache_mb": {
+                "description": "图片文件总容量 MB",
+                "type": "int",
+                "default": 256,
+                "hint": "范围 1～2048 MB；另有最多 10000 条图片索引及作者索引，数据库另计。"
+            },
+            "max_image_mb": {
+                "description": "单图大小 MB",
+                "type": "int",
+                "default": 20,
+                "hint": "范围 1～50 MB；超限图片跳过。"
+            },
+            "max_images_per_message": {
+                "description": "每条消息最多缓存图片数",
+                "type": "int",
+                "default": 20,
+                "hint": "范围 1～50 张；工具每次最多看 3 张。"
+            }
+        }
     }
 }

@@ -10,7 +10,7 @@ import json
 import mimetypes
 import re
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +24,7 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 
+from .image_extraction import collect_images
 from .sent_history import fingerprint
 from .shared_context import shared_group_limit
 
@@ -40,7 +41,7 @@ LLM_TYPES = {
 MISSING = object()
 
 
-def serialize_chain(message: Any) -> str | list[dict]:
+def serialize_chain(message: Any, *, defer_images: bool = False) -> str | list[dict]:
     """Preserve original text and locally available images without guessing captions.
 
     Args:
@@ -56,6 +57,9 @@ def serialize_chain(message: Any) -> str | list[dict]:
         if kind in {"plain", "text"}:
             parts.append({"type": "text", "text": component.text})
         elif kind == "image":
+            if defer_images:
+                parts.append({"type": "text", "text": "[图片消息，历史图片按需查看]"})
+                continue
             reference = getattr(component, "url", None) or getattr(
                 component, "file", None
             )
@@ -214,11 +218,27 @@ class SendCapture:
                 isinstance(result, MessageEventResult)
                 and result.result_content_type not in LLM_TYPES
             ):
+                images = getattr(self.plugin, "images", None)
+                image_enabled = bool(images and images.active(event))
                 event.set_extra(
                     RESULT_ORIGIN,
                     {
                         "source": source,
-                        "content": serialize_chain(result),
+                        "content": serialize_chain(
+                            result,
+                            defer_images=image_enabled,
+                        ),
+                        "image_candidates": collect_images(
+                            result.chain,
+                            None,
+                            message_id="",
+                            sender_id="",
+                            sender_name="",
+                            timestamp=0,
+                            limit=images.per_message,
+                        )
+                        if image_enabled
+                        else [],
                         "result": result,
                     },
                 )
@@ -315,11 +335,47 @@ class SendCapture:
             if conversation:
                 value = conversation.history
                 history = json.loads(value) if isinstance(value, str) else value
-        content = serialize_chain(message)
+        images = getattr(self.plugin, "images", None)
+        image_enabled = bool(
+            images
+            and images.enabled
+            and images.cache is not None
+            and not images.closing
+        )
+        if image_enabled:
+            session = MessageSession.from_str(umo)
+            platforms = self.context.platform_manager.platform_insts
+            platform = next(
+                (p for p in platforms if str(p.meta().id) == session.platform_id), None
+            )
+            image_enabled = bool(
+                platform
+                and platform.meta().name
+                in {"aiocqhttp", "qq_official", "qq_official_webhook"}
+                and (not images.platforms or platform.meta().name in images.platforms)
+            )
+        content = serialize_chain(message, defer_images=image_enabled)
         if origin and origin.get("result") is result:
             content = origin["content"]
         if not content:
             return None
+        image_candidates = []
+        if image_enabled:
+            image_candidates = collect_images(
+                getattr(message, "chain", []) or [],
+                None,
+                message_id="",
+                sender_id="",
+                sender_name="",
+                timestamp=0,
+                limit=images.per_message,
+            )
+            if (
+                origin
+                and origin.get("result") is result
+                and origin.get("image_candidates")
+            ):
+                image_candidates = origin["image_candidates"]
         event_id = str(
             getattr(getattr(event, "message_obj", None), "message_id", "") or ""
         )
@@ -329,6 +385,7 @@ class SendCapture:
             "receipts": set(),
             "source": source,
             "content": content,
+            "image_candidates": image_candidates,
             "trigger_id": event_id,
             # WakingStage strips prefixes from the event, not the message object.
             "trigger_text": (
@@ -378,11 +435,19 @@ class SendCapture:
         payload = {
             key: value
             for key, value in envelope.items()
-            if key not in {"umo", "cid", "receipts"}
+            if key not in {"umo", "cid", "receipts", "image_candidates"}
         }
         payload["message_ids"] = sorted(envelope["receipts"])
-        payload["sent_at"] = datetime.now(timezone.utc).isoformat()
+        payload["sent_at"] = datetime.now(UTC).isoformat()
         try:
+            images = getattr(self.plugin, "images", None)
+            if envelope.get("image_candidates") and images and not images.closing:
+                try:
+                    payload["content"] = await images.sent_content(envelope)
+                except Exception as exc:
+                    logger.warning(
+                        "[preserve_atbot] 插件历史图片保存失败 (%s)", type(exc).__name__
+                    )
             await asyncio.to_thread(
                 self.store.append,
                 envelope["umo"],
@@ -579,8 +644,6 @@ class SendCapture:
     def install(self) -> None:
         """Capture ordinary replies, proactive sends, and platform acknowledgements."""
         from aiocqhttp import CQHttp
-        from botpy.api import BotAPI
-
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )
@@ -588,6 +651,7 @@ class SendCapture:
             QQOfficialMessageEvent,
         )
         from astrbot.core.star.context import Context
+        from botpy.api import BotAPI
 
         for event_class in (AiocqhttpMessageEvent, QQOfficialMessageEvent):
             original = event_class.send
